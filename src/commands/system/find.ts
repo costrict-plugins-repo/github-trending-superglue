@@ -1,0 +1,136 @@
+import { type Command } from "commander";
+import type { SuperglueClient } from "@superglue/shared";
+import { findTemplateForSystem } from "@superglue/shared";
+import { output, error, table, isTableMode, isFullMode } from "../../output.js";
+import { getOwnedCredentialSet } from "./credentials-api.js";
+
+type ContextFn = () => { client: SuperglueClient };
+
+function getAuthType(system: any): string {
+  return system.authentication?.type || "none";
+}
+
+function getCredentialSummary(system: any): string {
+  return system.hasUserCredentials ? "credentials: configured" : "credentials: missing";
+}
+
+function filterSystemFields(
+  system: any,
+  credentialKeys?: Array<{ key: string; hasValue: boolean }>,
+) {
+  return {
+    id: system.id,
+    name: system.name,
+    url: system.url,
+    tags: system.tags,
+    authType: getAuthType(system),
+    hasUserCredentials: Boolean(system.hasUserCredentials),
+    ...(Array.isArray(system.requiredCredentialKeys) && system.requiredCredentialKeys.length > 0
+      ? { requiredCredentialKeys: system.requiredCredentialKeys }
+      : {}),
+    specificInstructions: system.specificInstructions,
+    credentialKeys: credentialKeys?.map((credential) => ({
+      ...credential,
+      placeholder: `<<${system.id}_${credential.key}>>`,
+    })),
+  };
+}
+
+export function registerFindCommand(parent: Command, getContext: ContextFn): void {
+  parent
+    .command("list")
+    .description("List all systems")
+    .option("--limit <n>", "Max results", "25")
+    .option("--offset <n>", "Skip first N results", "0")
+    .action(async (opts) => {
+      const { client } = getContext();
+      try {
+        const limit = Math.min(Math.max(parseInt(opts.limit, 10) || 25, 1), 100);
+        const offset = Math.max(parseInt(opts.offset, 10) || 0, 0);
+        const page = Math.floor(offset / limit) + 1;
+        const { items: rawItems, total } = await client.listSystems(limit, page);
+        const pageOffset = offset % limit;
+        const items = pageOffset > 0 ? rawItems.slice(pageOffset) : rawItems;
+        const full = isFullMode();
+
+        const rows = items.map((s: any) => {
+          return {
+            id: s.id,
+            name: s.name || "",
+            tags: Array.isArray(s.tags) ? s.tags.join(",") : "",
+            auth: getAuthType(s),
+            url: full ? s.url || "" : (s.url || "").slice(0, 40),
+            credentials: getCredentialSummary(s),
+          };
+        });
+
+        if (isTableMode()) {
+          table(rows, ["id", "name", "tags", "auth", "url", "credentials"], { total });
+        } else {
+          output({
+            success: true,
+            total,
+            hasMore: offset + items.length < total,
+            items: rows,
+          });
+        }
+      } catch (err: any) {
+        error(err.message);
+        process.exit(1);
+      }
+    });
+
+  parent
+    .command("find [query]")
+    .description("Find systems by query or exact ID")
+    .option("--id <exactId>", "Exact system ID lookup")
+    .action(async (query: string | undefined, opts) => {
+      const { client } = getContext();
+      try {
+        if (opts.id) {
+          const system = await client.getSystem(opts.id);
+          if (!system) {
+            error(`System not found: ${opts.id}`);
+            process.exit(1);
+          }
+          const templateMatch = findTemplateForSystem(system);
+          let credentialKeys: Array<{ key: string; hasValue: boolean }> | undefined;
+          if (system.hasUserCredentials) {
+            credentialKeys = (await getOwnedCredentialSet(client, system.id))?.credentialKeys;
+          }
+          output({
+            success: true,
+            system: filterSystemFields(system, credentialKeys),
+            template: templateMatch?.template || null,
+          });
+          return;
+        }
+
+        const rawQuery = (query || "*").trim();
+        const { items } = await client.listSystems(100, 1);
+
+        if (rawQuery === "*") {
+          output({
+            success: true,
+            systems: items.map((s: any) => filterSystemFields(s)),
+          });
+          return;
+        }
+
+        const keywords = rawQuery.toLowerCase().split(/\s+/);
+        const filtered = items.filter((s: any) => {
+          const text = [s.id, s.name, s.url].filter(Boolean).join(" ").toLowerCase();
+          return keywords.some((kw) => text.includes(kw));
+        });
+
+        // Always show full details including credentials
+        output({
+          success: true,
+          systems: filtered.map((s: any) => filterSystemFields(s)),
+        });
+      } catch (err: any) {
+        error(err.message);
+        process.exit(1);
+      }
+    });
+}

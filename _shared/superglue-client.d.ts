@@ -1,0 +1,413 @@
+import { AccessibleCredentials, ActivityDailyCount, BulkMutationResult, ClientRequestSource, CreateCredentialsRequest, CredentialSetSummary, ExecutionFileEnvelope, ExtractArgs, ExtractResult, FileReference, PatchSystemBody, OAuthExchangeCompleteRequest, OAuthExchangeCompleteResponse, OAuthExchangeRequest, OAuthExchangeStartResponse, RequestSource, RunClientInfo, RunExecutionKind, Run, RunLimitCheckResponse, System, Tool, ToolSchedule, ToolScheduleInput, ToolResult, UpdateCredentialsRequest } from "./types.js";
+import type { SystemAuthentication } from "./authentication.js";
+import { SSELogSubscriptionOptions, SSESubscription, type TokenProvider } from "./sse-log-subscription.js";
+export declare class SuperglueHttpError extends Error {
+    readonly status: number;
+    readonly code?: string;
+    readonly details?: Record<string, unknown>;
+    constructor(message: string, status: number, code?: string, details?: Record<string, unknown>);
+}
+export declare class SuperglueClient {
+    private tokenProvider;
+    private sseManager;
+    readonly apiEndpoint: string;
+    private onInfrastructureError?;
+    constructor({ apiKey, apiEndpoint, onInfrastructureError, sseTokenProvider, tokenProvider, }: {
+        apiKey?: string;
+        apiEndpoint?: string;
+        onInfrastructureError?: () => void;
+        sseTokenProvider?: TokenProvider;
+        tokenProvider?: TokenProvider;
+    });
+    protected getApiKey(): Promise<string>;
+    private isInfrastructureError;
+    protected restRequest<T>(method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE", path: string, body?: any, extraHeaders?: Record<string, string>, requestInit?: RequestInit): Promise<T>;
+    protected restResponse({ method, path, body, extraHeaders, requestInit, }: {
+        method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
+        path: string;
+        body?: any;
+        extraHeaders?: Record<string, string>;
+        requestInit?: RequestInit;
+    }): Promise<Response>;
+    private buildHttpError;
+    private streamRequest;
+    subscribeToLogsSSE(options?: SSELogSubscriptionOptions): Promise<SSESubscription>;
+    disconnect(): Promise<void>;
+    getMe(): Promise<{
+        userId?: string;
+        orgId: string;
+        orgName?: string;
+        roleIds: string[];
+        roles: any[];
+    }>;
+    /**
+     * Execute a saved tool by ID (creates run record)
+     */
+    runTool(params: {
+        toolId: string;
+        payload?: Record<string, any>;
+        files?: Record<string, ExecutionFileEnvelope>;
+        credentials?: Record<string, string>;
+        options?: {
+            timeout?: number;
+            traceId?: string;
+            webhookUrl?: string;
+            async?: boolean;
+            requestSource?: ClientRequestSource;
+            clientInfo?: RunClientInfo;
+            pinnedCredentials?: Record<string, string>;
+            /** @deprecated Use pinnedCredentials instead. */
+            credentialsList?: Record<string, string>;
+        };
+        runId?: string;
+        stateFixture?: Record<string, unknown>;
+        includeStepResultData?: boolean;
+        signal?: AbortSignal;
+    }): Promise<ToolResult>;
+    /**
+     * Execute a tool config directly without persisting the tool.
+     * Optionally creates a run record when `createRun` is true.
+     */
+    runToolConfig(params: {
+        tool: Tool;
+        payload?: Record<string, any>;
+        files?: Record<string, ExecutionFileEnvelope>;
+        credentials?: Record<string, string>;
+        options?: {
+            timeout?: number;
+            requestSource?: ClientRequestSource;
+        };
+        runId?: string;
+        stateFixture?: Record<string, unknown>;
+        traceId?: string;
+        createRun?: boolean;
+        executionKind?: RunExecutionKind;
+        parentToolId?: string;
+        draftId?: string;
+        includeStepResultData?: boolean;
+        signal?: AbortSignal;
+    }): Promise<ToolResult>;
+    abortToolExecution(runId: string): Promise<{
+        success: boolean;
+        runId: string;
+    }>;
+    /**
+     * Execute a single step. Individual playground tests can opt into run persistence.
+     */
+    executeStep({ step, payload, files, previousResults, credentials, options, runId, systemIds, createRun, parentToolId, stepIndex, stepId, signal, stream, }: {
+        step: any;
+        payload?: Record<string, any>;
+        files?: Record<string, ExecutionFileEnvelope>;
+        previousResults?: Record<string, any>;
+        credentials?: Record<string, string>;
+        options?: {
+            timeout?: number;
+        };
+        runId?: string;
+        systemIds?: string[];
+        createRun?: boolean;
+        parentToolId?: string;
+        stepIndex?: number;
+        stepId?: string;
+        signal?: AbortSignal;
+        stream?: boolean;
+    }): Promise<{
+        stepId: string;
+        success: boolean;
+        data?: any;
+        error?: string;
+        updatedStep?: any;
+        stepFileKeys?: string[];
+        producedFiles?: Record<string, ExecutionFileEnvelope>;
+    }>;
+    /**
+     * Abort an in-flight step execution by runId.
+     */
+    abortStep(runId: string): Promise<{
+        success: boolean;
+        runId: string;
+    }>;
+    /**
+     * Execute a final transform. Playground tests can opt into run persistence.
+     */
+    executeTransformOnly({ outputTransform, outputSchema, inputSchema, payload, files, stepResults, options, runId, createRun, parentToolId, stepId, signal, stream, }: {
+        outputTransform: string;
+        outputSchema?: any;
+        inputSchema?: any;
+        payload?: Record<string, any>;
+        files?: Record<string, ExecutionFileEnvelope>;
+        stepResults?: Record<string, any>;
+        options?: {
+            timeout?: number;
+        };
+        runId?: string;
+        createRun?: boolean;
+        parentToolId?: string;
+        stepId?: string;
+        signal?: AbortSignal;
+        stream?: boolean;
+    }): Promise<{
+        success: boolean;
+        data?: any;
+        error?: string;
+        updatedTransform?: string;
+        updatedOutputSchema?: any;
+        outputFiles?: Record<string, ExecutionFileEnvelope>;
+    }>;
+    /**
+     * Create a run entry in the database after manual tool execution.
+     * Used when "Run All Steps" completes in the playground.
+     */
+    createRun({ toolId, toolConfig, toolResult, stepResults, toolPayload, status, error, startedAt, completedAt, executionKind, parentToolId, draftId, }: {
+        toolId: string;
+        toolConfig: Tool;
+        toolResult?: unknown;
+        stepResults?: Array<{
+            stepId: string;
+            success: boolean;
+            data?: unknown;
+            error?: string;
+            stepFileKeys?: string[];
+        }>;
+        toolPayload?: Record<string, unknown>;
+        status: "success" | "failed" | "aborted";
+        error?: string;
+        startedAt: Date;
+        completedAt: Date;
+        executionKind?: RunExecutionKind;
+        parentToolId?: string;
+        draftId?: string;
+    }): Promise<{
+        runId: string;
+        toolId: string;
+        status: string;
+    }>;
+    checkRunLimit(): Promise<RunLimitCheckResponse>;
+    extract<T = any>({ file, envelope, }: ExtractArgs): Promise<ExtractResult & {
+        data?: T;
+        file?: ExecutionFileEnvelope;
+    }>;
+    private mapOpenAPIRunToRun;
+    private mapOpenAPIScheduleToToolSchedule;
+    listRuns(options?: {
+        limit?: number;
+        page?: number;
+        toolId?: string;
+        search?: string;
+        searchUserIds?: string[];
+        includeTotal?: boolean;
+        startedAfter?: string | Date;
+        status?: "running" | "success" | "failed" | "aborted";
+        requestSources?: RequestSource[];
+        executionKinds?: RunExecutionKind[];
+        userId?: string;
+        systemId?: string;
+        signal?: AbortSignal;
+    }): Promise<{
+        items: Run[];
+        total: number;
+        page: number;
+        limit: number;
+        hasMore: boolean;
+    }>;
+    getActivityCounts(options?: {
+        from?: string | Date;
+        to?: string | Date;
+        signal?: AbortSignal;
+    }): Promise<ActivityDailyCount[]>;
+    getRun(id: string): Promise<Run | null>;
+    getTool(id: string): Promise<Tool | null>;
+    getToolState(id: string): Promise<Record<string, unknown>>;
+    setToolState(id: string, state: Record<string, unknown>): Promise<string[]>;
+    deleteToolState(id: string): Promise<number>;
+    archiveTool(id: string, archived?: boolean): Promise<Tool>;
+    bulkArchiveTools(ids: string[], archived?: boolean): Promise<BulkMutationResult>;
+    bulkDeleteTools(ids: string[]): Promise<BulkMutationResult>;
+    listTools(limit?: number, offset?: number, includeArchived?: boolean): Promise<{
+        items: Tool[];
+        total: number;
+    }>;
+    createTool(id: string, input: Partial<Tool>): Promise<Tool>;
+    updateTool(id: string, input: Partial<Tool>): Promise<Tool>;
+    deleteTool(id: string): Promise<boolean>;
+    renameTool(oldId: string, newId: string): Promise<Tool>;
+    /**
+     * @deprecated Use getTool instead.
+     */
+    getWorkflow(id: string): Promise<Tool | null>;
+    /**
+     * @deprecated Use archiveTool instead.
+     */
+    archiveWorkflow(id: string, archived?: boolean): Promise<Tool>;
+    /**
+     * @deprecated Use listTools instead.
+     */
+    listWorkflows(limit?: number, offset?: number, includeArchived?: boolean): Promise<{
+        items: Tool[];
+        total: number;
+    }>;
+    /**
+     * @deprecated Use createTool instead.
+     */
+    createWorkflow(id: string, input: Partial<Tool>): Promise<Tool>;
+    /**
+     * @deprecated Use updateTool instead.
+     */
+    updateWorkflow(id: string, input: Partial<Tool>): Promise<Tool>;
+    /**
+     * @deprecated TODO: reevaluate removing this compatibility wrapper after explicit
+     * create/update tool adoption in this branch is complete. Prefer createTool
+     * or updateTool so caller intent is explicit.
+     */
+    upsertWorkflow(id: string, input: Partial<Tool>): Promise<Tool>;
+    /**
+     * @deprecated Use deleteTool instead.
+     */
+    deleteWorkflow(id: string): Promise<boolean>;
+    /**
+     * @deprecated Use renameTool instead.
+     */
+    renameWorkflow(oldId: string, newId: string): Promise<Tool>;
+    listToolSchedules(toolId?: string): Promise<ToolSchedule[]>;
+    listToolSchedules(options: {
+        toolId?: string;
+        limit?: number;
+        page?: number;
+    }): Promise<{
+        items: ToolSchedule[];
+        total: number;
+        page: number;
+        limit: number;
+        hasMore: boolean;
+    }>;
+    listToolSchedulesPage(options?: {
+        toolId?: string;
+        limit?: number;
+        page?: number;
+    }): Promise<{
+        items: ToolSchedule[];
+        total: number;
+        page: number;
+        limit: number;
+        hasMore: boolean;
+    }>;
+    getToolSchedule(toolId: string, scheduleId: string): Promise<ToolSchedule | null>;
+    createToolSchedule(toolId: string, schedule: Pick<ToolScheduleInput, "cronExpression" | "timezone"> & Pick<ToolScheduleInput, "enabled" | "payload" | "options">): Promise<ToolSchedule>;
+    updateToolSchedule(toolId: string, scheduleId: string, updates: Pick<ToolScheduleInput, "cronExpression" | "timezone" | "enabled" | "payload" | "options">): Promise<ToolSchedule>;
+    deleteToolSchedule(toolId: string, scheduleId: string): Promise<boolean>;
+    bulkSetSchedulesEnabled(ids: string[], enabled: boolean): Promise<BulkMutationResult>;
+    bulkDeleteSchedules(ids: string[]): Promise<BulkMutationResult>;
+    listCredentials(params?: {
+        systemId?: string;
+    }): Promise<AccessibleCredentials[]>;
+    createCredentials(params: CreateCredentialsRequest): Promise<CredentialSetSummary>;
+    replaceCredentials(id: string, credentials: Record<string, unknown>): Promise<CredentialSetSummary>;
+    updateCredentials(id: string, params: UpdateCredentialsRequest): Promise<CredentialSetSummary>;
+    deleteCredentials(id: string): Promise<void>;
+    setDefaultCredentials(id: string): Promise<void>;
+    listSystems(limit?: number, page?: number): Promise<{
+        items: System[];
+        total: number;
+    }>;
+    getSystem(id: string): Promise<System>;
+    createSystem(input: {
+        id: string;
+        name: string;
+        url: string;
+        credentials?: Record<string, any>;
+        authentication?: SystemAuthentication;
+        specificInstructions?: string;
+        icon?: string;
+        templateName?: string;
+        documentationFiles?: Record<string, string[]>;
+        metadata?: Record<string, any>;
+        requiredCredentialKeys?: string[];
+        tunnel?: {
+            tunnelId: string;
+        };
+        tags?: string[];
+    }): Promise<System>;
+    updateSystem(id: string, input: PatchSystemBody): Promise<System>;
+    deleteSystem(id: string): Promise<boolean>;
+    bulkDeleteSystems(ids: string[]): Promise<BulkMutationResult>;
+    createOAuthExchange(params: OAuthExchangeRequest): Promise<OAuthExchangeStartResponse>;
+    completeOAuthExchange(oauthExchangeId: string, params: OAuthExchangeCompleteRequest): Promise<OAuthExchangeCompleteResponse>;
+    searchSystemDocumentation(systemId: string, keywords: string): Promise<string>;
+    triggerSystemDocumentationScrapeJob(systemId: string, options?: {
+        url?: string;
+        keywords?: string[];
+        link?: boolean;
+    }): Promise<{
+        fileReferenceId: string;
+        status: string;
+    }>;
+    fetchOpenApiSpec(systemId: string, url: string, options?: {
+        link?: boolean;
+    }): Promise<{
+        fileReferenceId: string;
+        title?: string;
+        version?: string;
+    }>;
+    createSystemFileUploadUrls(systemId: string, files: Array<{
+        fileName: string;
+        contentType?: string;
+        contentLength?: number;
+    }>, options?: {
+        link?: boolean;
+    }): Promise<Array<{
+        id: string;
+        originalFileName: string;
+        uploadUrl: string;
+        expiresIn: number;
+    }>>;
+    uploadSystemFileReferences(systemId: string, files: Array<{
+        fileName: string;
+        content: string | Uint8Array | Blob;
+        contentType?: string;
+        contentLength?: number;
+    }>, options?: {
+        link?: boolean;
+        settle?: boolean;
+    }): Promise<Array<{
+        id: string;
+        fileName: string;
+        contentLength?: number;
+        status: "uploaded" | "failed";
+        error?: string;
+    }>>;
+    processFileReference(fileId: string): Promise<{
+        success: boolean;
+        fileId: string;
+        processedStorageUri?: string;
+    }>;
+    listSystemFileReferences(systemId: string): Promise<{
+        files: Array<{
+            id: string;
+            source: "upload" | "scrape" | "openapi";
+            status: string;
+            fileName: string;
+            sourceUrl?: string;
+            error?: string;
+            createdAt?: string;
+            contentLength?: number;
+        }>;
+    }>;
+    listFileReferences(fileIds: string[]): Promise<{
+        files: FileReference[];
+        total: number;
+    }>;
+    deleteSystemFileReference(systemId: string, fileId: string): Promise<void>;
+    getFileReferenceContent(fileId: string): Promise<string | null>;
+    /**
+     * Generate a credentials login link for the current API key user.
+     * The returned URL opens the login flow and then redirects to Credentials.
+     */
+    generateCredentialsLink(input?: {
+        systemId?: string;
+    }): Promise<{
+        success: boolean;
+        credentialsUrl?: string;
+        error?: string;
+    }>;
+}
+//# sourceMappingURL=superglue-client.d.ts.map

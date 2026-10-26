@@ -1,0 +1,270 @@
+import * as fs from "node:fs";
+import * as path from "node:path";
+import * as crypto from "node:crypto";
+import type { Command } from "commander";
+import type { SuperglueClient } from "@superglue/shared";
+import { RequestSource, RunExecutionKind } from "@superglue/shared";
+import type { CLIConfig, CLIPreset } from "../../config.js";
+import { isToolRunModeAllowed } from "../../presets.js";
+import { readDraft } from "../../drafts.js";
+import { parseFileFlags, resolvePayloadWithFiles } from "../../files.js";
+import { output, error, success, info, spinner, colors as c } from "../../output.js";
+
+type ContextFn = () => { config: CLIConfig; client: SuperglueClient };
+
+export function registerRunCommand(
+  parent: Command,
+  getContext: ContextFn,
+  preset: CLIPreset,
+): void {
+  parent
+    .command("run")
+    .description("Execute a draft, saved tool, or inline tool config")
+    .option("--draft <id>", "Draft ID from build")
+    .option("--tool <id>", "Saved tool ID")
+    .option("--config <json>", "Inline tool config JSON")
+    .option("--config-file <path>", "Tool config JSON file")
+    .option("--payload <json>", "JSON payload")
+    .option("--payload-file <path>", "JSON payload file")
+    .option(
+      "--file <key=path...>",
+      "File references",
+      (v: string, arr: string[]) => {
+        arr.push(v);
+        return arr;
+      },
+      [],
+    )
+    .option("--include-step-results", "Include raw step results")
+    .option("--include-config", "Include full tool config")
+    .option("--state-fixture <json>", "Seed sourceData.persistedState for this run only")
+    .option("--state-fixture-file <path>", "Seed state from a JSON file")
+    .option("--timeout <ms>", "Per-request timeout in milliseconds (minimum 1000)")
+    .addHelpText(
+      "after",
+      `
+Provide exactly one of: --tool, --draft, --config, or --config-file.
+Returns: { success, data, error? }
+
+--state-fixture seeds sourceData.persistedState in place of the tool's real state;
+a seeded run never saves state changes. Use 'sg tool state set' to set real state.
+
+Run 'sg skill' for payload syntax, variable references, and data selectors.
+`,
+    )
+    .action(async (opts) => {
+      const { config, client } = getContext();
+
+      const selectors = [opts.tool, opts.draft, opts.config, opts.configFile].filter(Boolean);
+      if (selectors.length === 0) {
+        error(
+          "Provide one of --tool, --draft, --config, or --config-file. Run 'sg skill' for usage examples.",
+        );
+        process.exit(1);
+      }
+      if (selectors.length > 1) {
+        error("Only one of --tool, --draft, --config, or --config-file can be used");
+        process.exit(1);
+      }
+
+      const usedMode = opts.tool
+        ? "tool"
+        : opts.draft
+          ? "draft"
+          : opts.configFile
+            ? "config-file"
+            : "config";
+      if (!isToolRunModeAllowed(preset, usedMode)) {
+        error(
+          `--${usedMode} is not available in the '${preset}' preset. Use --tool <id> to run a saved tool, or change preset to 'builder' or 'admin'.`,
+        );
+        process.exit(1);
+      }
+
+      const filePayloads = await parseFileFlags(opts.file, client);
+      let payload: any;
+      try {
+        payload = opts.payloadFile
+          ? JSON.parse(fs.readFileSync(opts.payloadFile, "utf-8"))
+          : opts.payload
+            ? JSON.parse(opts.payload)
+            : undefined;
+      } catch (err: any) {
+        error(`Invalid payload JSON: ${err.message}. Run 'sg skill' for payload syntax.`);
+        process.exit(1);
+      }
+
+      if (payload) {
+        const fileResult = resolvePayloadWithFiles(payload, filePayloads);
+        if (!fileResult.success) {
+          error(fileResult.error);
+          process.exit(1);
+        }
+        payload = fileResult.resolved;
+      }
+
+      let stateFixture: Record<string, unknown> | undefined;
+      if (opts.stateFixture !== undefined || opts.stateFixtureFile !== undefined) {
+        if (opts.stateFixture !== undefined && opts.stateFixtureFile !== undefined) {
+          error("Only one of --state-fixture or --state-fixture-file can be used");
+          process.exit(1);
+        }
+        let parsedFixture: unknown;
+        try {
+          parsedFixture = JSON.parse(
+            opts.stateFixtureFile
+              ? fs.readFileSync(opts.stateFixtureFile, "utf-8")
+              : opts.stateFixture,
+          );
+        } catch (err: any) {
+          error(`Invalid state fixture JSON: ${err.message}`);
+          process.exit(1);
+        }
+        if (
+          parsedFixture === null ||
+          typeof parsedFixture !== "object" ||
+          Array.isArray(parsedFixture)
+        ) {
+          error("--state-fixture must be a plain JSON object");
+          process.exit(1);
+        }
+        stateFixture = parsedFixture as Record<string, unknown>;
+      }
+
+      let result: any;
+      const toolLabel = opts.tool || opts.draft || "inline-config";
+      const traceId = crypto.randomUUID();
+
+      let timeout: number | undefined;
+      if (opts.timeout !== undefined) {
+        const parsed = Number(opts.timeout);
+        if (!Number.isInteger(parsed) || parsed < 1000) {
+          error("--timeout must be an integer of at least 1000 (milliseconds)");
+          process.exit(1);
+        }
+        timeout = parsed;
+      }
+
+      const spin = spinner(`Running ${c.bold}${toolLabel}${c.reset}...`);
+
+      const logSub = await client
+        .subscribeToLogsSSE({
+          traceId,
+          onLog: (log) => spin.log(`${c.dim}${log.message}${c.reset}`),
+        })
+        .catch(() => ({ unsubscribe: () => {} }));
+
+      const runToolConfig = async (
+        toolConfig: any,
+        options: {
+          executionKind: RunExecutionKind;
+          draftId?: string;
+          parentToolId?: string;
+        },
+      ) => {
+        try {
+          const res = await client.runToolConfig({
+            tool: toolConfig,
+            payload,
+            includeStepResultData: opts.includeStepResults === true,
+            options: { requestSource: RequestSource.CLI, timeout },
+            traceId,
+            createRun: true,
+            executionKind: options.executionKind,
+            parentToolId: options.parentToolId,
+            draftId: options.draftId,
+            stateFixture,
+          });
+          logSub.unsubscribe();
+          spin.stop();
+          return res;
+        } catch (err: any) {
+          logSub.unsubscribe();
+          spin.stop();
+          error(err.message);
+          process.exit(1);
+        }
+      };
+
+      if (opts.tool) {
+        try {
+          result = await client.runTool({
+            toolId: opts.tool,
+            payload,
+            includeStepResultData: opts.includeStepResults === true,
+            options: { requestSource: RequestSource.CLI, traceId, timeout },
+            stateFixture,
+          });
+          logSub.unsubscribe();
+          spin.stop();
+        } catch (err: any) {
+          logSub.unsubscribe();
+          spin.stop();
+          error(err.message);
+          process.exit(1);
+        }
+      } else if (opts.config || opts.configFile) {
+        let toolConfig: any;
+        try {
+          toolConfig = opts.configFile
+            ? JSON.parse(fs.readFileSync(opts.configFile, "utf-8"))
+            : JSON.parse(opts.config);
+        } catch (err: any) {
+          logSub.unsubscribe();
+          spin.stop();
+          error(
+            `Invalid tool config JSON: ${err.message}. Run 'sg skill' for the full tool-building reference.`,
+          );
+          process.exit(1);
+        }
+        result = await runToolConfig(toolConfig, { executionKind: RunExecutionKind.FULL });
+      } else {
+        const draft = readDraft(opts.draft);
+        if (!draft) {
+          logSub.unsubscribe();
+          spin.stop();
+          error(`Draft not found: ${opts.draft}`);
+          process.exit(1);
+        }
+        result = await runToolConfig(draft.config, {
+          executionKind: RunExecutionKind.DRAFT,
+          draftId: draft.draftId,
+          parentToolId: draft.config?.id,
+        });
+      }
+
+      const out: any = {
+        success: result.success,
+        data: result.data,
+        ...(result.error ? { error: result.error } : {}),
+        ...(result.warnings?.length ? { warnings: result.warnings } : {}),
+        ...(result.fileArtifacts && result.fileArtifacts.length > 0
+          ? { fileArtifacts: result.fileArtifacts }
+          : {}),
+        ...(opts.includeStepResults && result.stepResults
+          ? { stepResults: result.stepResults }
+          : {}),
+        ...(opts.includeConfig && result.tool ? { config: result.tool } : {}),
+        ...(result.important_notice ? { important_notice: result.important_notice } : {}),
+      };
+
+      output(out);
+
+      if (result.fileArtifacts && result.fileArtifacts.length > 0) {
+        info(
+          `${result.fileArtifacts.length} file(s) available — use the downloadUrl from the output to download`,
+        );
+      }
+
+      if (config.output.mode === "stdout+file") {
+        const outDir = path.resolve(config.output.directory);
+        if (!fs.existsSync(outDir)) fs.mkdirSync(outDir, { recursive: true });
+        const rawId = opts.tool || opts.draft || "inline-config";
+        const safeId = path.basename(rawId).replace(/[^a-zA-Z0-9_-]/g, "_");
+        const filename = `${safeId}-${Date.now()}.json`;
+        fs.writeFileSync(path.join(outDir, filename), JSON.stringify(out, null, 2));
+      }
+
+      if (!result.success) process.exit(1);
+    });
+}

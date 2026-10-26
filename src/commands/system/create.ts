@@ -1,0 +1,166 @@
+import * as fs from "node:fs";
+import { type Command } from "commander";
+import type { SuperglueClient } from "@superglue/shared";
+import { systems, slugify, findTemplateForSystem } from "@superglue/shared";
+import type { CLIConfig } from "../../config.js";
+import { output, error, success, spinner, colors as c, isTableMode } from "../../output.js";
+
+type ContextFn = () => { config: CLIConfig; client: SuperglueClient };
+
+export function registerCreateCommand(parent: Command, getContext: ContextFn): void {
+  parent
+    .command("create")
+    .description("Create a new system")
+    .option("--config <file>", "JSON config file")
+    .option("--id <id>", "System ID (derived from name if omitted)")
+    .option("--name <name>", "Human-readable name (required)")
+    .option("--url <url>", "API URL")
+    .option(
+      "--template <id>",
+      "Template ID — auto-fills URL, OAuth config, and credentials. Auto-detected from URL if omitted.",
+    )
+    .option("--instructions <text>", "Specific instructions")
+    .option("--credentials <json>", "Credentials JSON (all fields including secrets)")
+    .option("--authentication <json>", "Authentication config JSON")
+    .option("--docs-url <url>", "Documentation URL to scrape")
+    .option("--openapi-url <url>", "OpenAPI spec URL")
+    .addHelpText("after", () => {
+      const oauthTemplates = Object.entries(systems)
+        .filter(([, t]) => t.oauth)
+        .map(([key, t]) => `  ${key.padEnd(24)} ${t.name}`)
+        .join("\n");
+      return `\nOAuth templates (use with --template or auto-detected from URL):\n${oauthTemplates}\n`;
+    })
+    .action(async (opts) => {
+      const { client } = getContext();
+
+      let systemInput: any;
+      if (opts.config) {
+        try {
+          const parsed = JSON.parse(fs.readFileSync(opts.config, "utf-8"));
+          systemInput = parsed;
+        } catch (err: any) {
+          error(`Invalid config file: ${err.message}`);
+          process.exit(1);
+        }
+      } else {
+        let credentials: any;
+        let authentication: any;
+        if (opts.credentials) {
+          try {
+            credentials = JSON.parse(opts.credentials);
+          } catch (err: any) {
+            error(`Invalid --credentials JSON: ${err.message}`);
+            process.exit(1);
+          }
+        }
+        if (opts.authentication) {
+          try {
+            authentication = JSON.parse(opts.authentication);
+          } catch (err: any) {
+            error(`Invalid --authentication JSON: ${err.message}`);
+            process.exit(1);
+          }
+        }
+        systemInput = {
+          id: opts.id,
+          name: opts.name,
+          url: opts.url,
+          specificInstructions: opts.instructions,
+          credentials,
+          authentication,
+        };
+      }
+
+      let templateKey: string | undefined = opts.template;
+      let template: (typeof systems)[string] | undefined;
+
+      if (templateKey) {
+        template = systems[templateKey];
+        if (!template) {
+          error(
+            `Template not found: ${templateKey}. Available: ${Object.keys(systems).join(", ")}`,
+          );
+          process.exit(1);
+        }
+      } else if (systemInput.url || systemInput.name || systemInput.id) {
+        const match = findTemplateForSystem({
+          url: systemInput.url,
+          name: systemInput.name,
+          id: systemInput.id,
+        });
+        if (match) {
+          templateKey = match.key;
+          template = match.template;
+          if (process.stderr.isTTY) {
+            process.stderr.write(
+              `${c.dim}Auto-detected template: ${c.bold}${templateKey}${c.reset}${c.dim} (use --template to override)${c.reset}\n`,
+            );
+          }
+        }
+      }
+
+      if (template && templateKey) {
+        const oauthCreds: Record<string, any> = {};
+        if (template.oauth) {
+          if (template.oauth.authUrl) oauthCreds.auth_url = template.oauth.authUrl;
+          if (template.oauth.tokenUrl) oauthCreds.token_url = template.oauth.tokenUrl;
+          if (template.oauth.scopes) oauthCreds.scopes = template.oauth.scopes;
+          if (template.oauth.client_id) oauthCreds.client_id = template.oauth.client_id;
+        }
+        systemInput = {
+          ...systemInput,
+          name: systemInput.name || template.name,
+          url: systemInput.url || template.apiUrl,
+          templateName: templateKey,
+          credentials: { ...oauthCreds, ...systemInput.credentials },
+        };
+      }
+
+      if (typeof systemInput.name !== "string" || systemInput.name.trim() === "") {
+        error("System name is required (--name)");
+        process.exit(1);
+      }
+      if (!systemInput.id) {
+        systemInput.id = slugify(systemInput.name.trim());
+        if (!systemInput.id) {
+          error("System ID could not be derived from name; use --id with letters or numbers");
+          process.exit(1);
+        }
+      }
+
+      try {
+        const spin = spinner(`Creating system ${c.bold}${systemInput.id}${c.reset}...`);
+        const result = await client.createSystem(systemInput);
+        spin.stop();
+
+        if (opts.docsUrl) {
+          try {
+            await client.triggerSystemDocumentationScrapeJob(result.id, { url: opts.docsUrl });
+          } catch {}
+        }
+        if (opts.openapiUrl) {
+          try {
+            await client.fetchOpenApiSpec(result.id, opts.openapiUrl);
+          } catch {}
+        }
+
+        if (isTableMode()) {
+          success(`System created: ${c.bold}${result.id}${c.reset}`, {
+            name: result.name,
+            url: result.url,
+            ...(templateKey ? { template: templateKey } : {}),
+          });
+        } else {
+          output({
+            success: true,
+            system: { id: result.id, name: result.name, url: result.url },
+            ...(templateKey ? { template: templateKey } : {}),
+          });
+        }
+      } catch (err: any) {
+        error(err.message);
+        process.exit(1);
+      }
+    });
+}
